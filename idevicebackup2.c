@@ -57,6 +57,9 @@
 #include <windows.h>
 #include <conio.h>
 #define sleep(x) Sleep(x*1000)
+#ifndef ELOOP
+#define ELOOP 114
+#endif
 #else
 #include <termios.h>
 #include <sys/statvfs.h>
@@ -70,6 +73,8 @@
 
 static int verbose = 1;
 static int quit_flag = 0;
+static int passcode_requested = 0;
+static char *last_processed_file = NULL;
 
 #define PRINT_VERBOSE(min_level, ...) if (verbose >= min_level) { printf(__VA_ARGS__); };
 
@@ -111,6 +116,10 @@ static void notify_cb(const char *notification, void *userdata)
 		quit_flag++;
 	} else if (!strcmp(notification, NP_BACKUP_DOMAIN_CHANGED)) {
 		backup_domain_changed = 1;
+		} else if (!strcmp(notification, "com.apple.LocalAuthentication.ui.presented")) {
+		passcode_requested = 1;
+	} else if (!strcmp(notification, "com.apple.LocalAuthentication.ui.dismissed")) {
+		passcode_requested = 0;
 	} else {
 		PRINT_VERBOSE(1, "Unhandled notification '%s' (TODO: implement)\n", notification);
 	}
@@ -733,6 +742,52 @@ static void mb2_multi_status_add_file_error(plist_t status_dict, const char *pat
 	plist_dict_set_item(status_dict, path, filedict);
 }
 
+static void mb2_print_file_error(plist_t status_dict, const char *path)
+{
+	if (!status_dict || !path) return;
+
+	plist_t filedict = plist_dict_get_item(status_dict, path);
+	if (!filedict || plist_get_node_type(filedict) != PLIST_DICT) {
+		return;
+	}
+
+	plist_t code_node = plist_dict_get_item(filedict, "DLFileErrorCode");
+	plist_t msg_node = plist_dict_get_item(filedict, "DLFileErrorString");
+	uint64_t code = 0;
+	char *message = NULL;
+
+	if (code_node && plist_get_node_type(code_node) == PLIST_UINT) {
+		plist_get_uint_val(code_node, &code);
+	}
+	if (msg_node && plist_get_node_type(msg_node) == PLIST_STRING) {
+		plist_get_string_val(msg_node, &message);
+	}
+
+	if (message) {
+		fprintf(stderr, "ERROR: Failed to send file '%s': %s (%llu)\n", path, message, (unsigned long long)code);
+		free(message);
+	} else if (code_node) {
+		fprintf(stderr, "ERROR: Failed to send file '%s' (error code %llu)\n", path, (unsigned long long)code);
+	} else {
+		fprintf(stderr, "ERROR: Failed to send file '%s'\n", path);
+	}
+}
+
+static void mb2_print_plist_debug(plist_t node, const char *label)
+{
+	if (!node || !label) return;
+
+	char *xml = NULL;
+	uint32_t xml_len = 0;
+	plist_to_xml(node, &xml, &xml_len);
+	if (!xml) {
+		return;
+	}
+
+	fprintf(stderr, "%s\n%s\n", label, xml);
+	free(xml);
+}
+
 static int errno_to_device_error(int errno_value)
 {
 	switch (errno_value) {
@@ -740,8 +795,19 @@ static int errno_to_device_error(int errno_value)
 			return -6;
 		case EEXIST:
 			return -7;
+
+		case ENOTDIR:
+			return -8;
+		case EISDIR:
+			return -9;
+		case ELOOP:
+			return -10;
+		case EIO:
+			return -11;
+		case ENOSPC:
+			return -15;
 		default:
-			return -errno_value;
+			return -1;
 	}
 }
 
@@ -752,6 +818,12 @@ static int mb2_handle_send_file(mobilebackup2_client_t mobilebackup2, const char
 	uint32_t bytes = 0;
 	char *localfile = string_build_path(backup_dir, path, NULL);
 	char buf[32768];
+
+	// Track the current file being processed
+	if (last_processed_file) {
+		free(last_processed_file);
+	}
+	last_processed_file = strdup(path);
 #ifdef WIN32
 	struct _stati64 fst;
 #else
@@ -871,6 +943,9 @@ leave:
 		}
 		char *errdesc = strerror(errcode);
 		mb2_multi_status_add_file_error(*errplist, path, errno_to_device_error(errcode), errdesc);
+		if (restore_debug_mode) {
+			fprintf(stderr, "ERROR: Local file failure '%s': %s (%d)\n", path, errdesc, errcode);
+		}
 
 		length = strlen(errdesc);
 		nlen = htobe32(length+1);
@@ -917,7 +992,16 @@ static void mb2_handle_send_files(mobilebackup2_client_t mobilebackup2, plist_t 
 		if (!str)
 			continue;
 
+		// Debug output: show which file is being sent
+		if (restore_debug_mode) {
+			PRINT_VERBOSE(1, "  [%u/%u] Sending: %s\n", i + 1, cnt, str);
+		}
+
 		if (mb2_handle_send_file(mobilebackup2, backup_dir, str, &errplist) < 0) {
+			mb2_print_file_error(errplist, str);
+			if (restore_debug_mode) {
+				PRINT_VERBOSE(1, "  [ERROR] Failed to send file: %s\n", str);
+			}
 			free(str);
 			//printf("Error when sending file '%s' to device\n", str);
 			// TODO: perhaps we can continue, we've got a multi status response?!
@@ -935,6 +1019,9 @@ static void mb2_handle_send_files(mobilebackup2_client_t mobilebackup2, plist_t 
 		mobilebackup2_send_status_response(mobilebackup2, 0, NULL, emptydict);
 		plist_free(emptydict);
 	} else {
+		if (restore_debug_mode) {
+			mb2_print_plist_debug(errplist, "Local file errors (multi-status):");
+		}
 		mobilebackup2_send_status_response(mobilebackup2, -13, "Multi status", errplist);
 		plist_free(errplist);
 	}
@@ -1438,7 +1525,7 @@ static void print_usage(int argc, char **argv)
 
 #define DEVICE_VERSION(maj, min, patch) (((maj & 0xFF) << 16) | ((min & 0xFF) << 8) | (patch & 0xFF))
 
-int mainLOL(char *path, char *uuidi)
+int mainLOL(char *path, char *uuidi, char *backup_password)
 {
 	idevice_error_t ret = IDEVICE_E_UNKNOWN_ERROR;
 	lockdownd_error_t ldret = LOCKDOWN_E_UNKNOWN_ERROR;
@@ -1453,7 +1540,7 @@ int mainLOL(char *path, char *uuidi)
 	int result_code = -1;
 	char* backup_directory = NULL;
 	int interactive_mode = 0;
-	char* backup_password = NULL;
+	int password_allocated = 0;  /* Track if we allocated backup_password */
 	char* newpw = NULL;
 	struct stat st;
 	plist_t node_tmp = NULL;
@@ -1589,11 +1676,13 @@ int mainLOL(char *path, char *uuidi)
 	if ((ldret == LOCKDOWN_E_SUCCESS) && service && service->port) {
 		np_client_new(device, service, &np);
 		np_set_notify_callback(np, notify_cb, NULL);
-		const char *noties[5] = {
+		const char *noties[7] = {
 			NP_SYNC_CANCEL_REQUEST,
 			NP_SYNC_SUSPEND_REQUEST,
 			NP_SYNC_RESUME_REQUEST,
 			NP_BACKUP_DOMAIN_CHANGED,
+			"com.apple.LocalAuthentication.ui.presented",
+			"com.apple.LocalAuthentication.ui.dismissed",
 			NULL
 		};
 		np_observe_notifications(np, noties);
@@ -1727,6 +1816,18 @@ checkpoint:
 				plist_dict_set_item(opts, "Password", plist_new_string(backup_password));
 			}
 
+			/* Verbose: print restore request arguments */
+			PRINT_VERBOSE(1, "Restore request arguments:\n");
+			PRINT_VERBOSE(1, "  Request type:            Restore\n");
+			PRINT_VERBOSE(1, "  Target UDID:             %s\n", udid);
+			PRINT_VERBOSE(1, "  Source UDID:             %s\n", source_udid);
+			PRINT_VERBOSE(1, "  RestoreSystemFiles:      %s\n", (cmd_flags & CMD_FLAG_RESTORE_SYSTEM_FILES) ? "true" : "false");
+			PRINT_VERBOSE(1, "  RestoreShouldReboot:     %s\n", (cmd_flags & CMD_FLAG_RESTORE_NO_REBOOT) ? "false" : "true (default)");
+			PRINT_VERBOSE(1, "  RestoreDontCopyBackup:   %s\n", (cmd_flags & CMD_FLAG_RESTORE_COPY_BACKUP) ? "false" : "true");
+			PRINT_VERBOSE(1, "  RestorePreserveSettings: %s\n", (cmd_flags & CMD_FLAG_RESTORE_SETTINGS) ? "false" : "true");
+			PRINT_VERBOSE(1, "  RemoveItemsNotRestored:  %s\n", (cmd_flags & CMD_FLAG_RESTORE_REMOVE_ITEMS) ? "true" : "false");
+			PRINT_VERBOSE(1, "  Password:                %s\n", (backup_password != NULL) ? "<set>" : "<not set>");
+
 			if (cmd_flags & CMD_FLAG_RESTORE_SKIP_APPS) {
 			} else {
 				/* Write /iTunesRestore/RestoreApplications.plist so that the device will start
@@ -1807,6 +1908,7 @@ checkpoint:
 				if (willEncrypt) {
 					if (!backup_password) {
 						backup_password = ask_for_password("Enter current backup password", 0);
+						password_allocated = 1;
 					}
 				} else {
 					printf("ERROR: Backup encryption is not enabled. Aborting.\n");
@@ -1820,6 +1922,7 @@ checkpoint:
 				if (willEncrypt) {
 					if (!backup_password) {
 						backup_password = ask_for_password("Enter old backup password", 0);
+						password_allocated = 1;
 						newpw = ask_for_password("Enter new backup password", 1);
 					}
 				} else {
@@ -2101,13 +2204,16 @@ checkpoint:
 					if (nn && (plist_get_node_type(nn) == PLIST_STRING)) {
 						plist_get_string_val(nn, &str);
 					}
-					if (error_code != 0) {
-						if (str) {
-							printf("ErrorCode %d: %s\n", error_code, str);
-						} else {
-							printf("ErrorCode %d: (Unknown)\n", error_code);
-						}
+				if (error_code != 0) {
+					if (str) {
+						printf("ErrorCode %d: %s\n", error_code, str);
+					} else {
+						printf("ErrorCode %d: (Unknown)\n", error_code);
 					}
+					if (restore_debug_mode) {
+						mb2_print_plist_debug(node_tmp, "Device error details:");
+					}
+				}
 					if (str) {
 						free(str);
 					}
@@ -2126,9 +2232,12 @@ checkpoint:
 				if ((overall_progress > 0) && !progress_finished) {
 					if (overall_progress >= 100.0f) {
 						progress_finished = 1;
+						print_progress_real(overall_progress, 0);
+						PRINT_VERBOSE(1, " Finished\n");
+					} else {
+						print_progress_real(overall_progress, 0);
+						fflush(stdout);
 					}
-					print_progress_real(overall_progress, 0);
-					PRINT_VERBOSE(1, " Finished\n");
 				}
 
 files_out:
@@ -2216,15 +2325,18 @@ files_out:
 					if ((cmd_flags & CMD_FLAG_RESTORE_NO_REBOOT) == 0)
 						PRINT_VERBOSE(1, "The device should reboot now.\n");
 					PRINT_VERBOSE(1, "Restore Successful.\n");
-				} else {
-					afc_remove_path(afc, "/iTunesRestore/RestoreApplications.plist");
-					afc_remove_path(afc, "/iTunesRestore");
-					if (quit_flag) {
-						PRINT_VERBOSE(1, "Restore Aborted.\n");
-					} else {
-						PRINT_VERBOSE(1, "Restore Failed (Error Code %d).\n", -result_code);
+} else {
+						afc_remove_path(afc, "/iTunesRestore/RestoreApplications.plist");
+						afc_remove_path(afc, "/iTunesRestore");
+						if (quit_flag) {
+							PRINT_VERBOSE(1, "Restore Aborted.\n");
+						} else {
+							PRINT_VERBOSE(1, "Restore Failed (Error Code %d).\n", -result_code);
+							if (last_processed_file) {
+								PRINT_VERBOSE(1, "Last file processed: %s\n", last_processed_file);
+							}
+						}
 					}
-				}
 				break;
 				case CMD_INFO:
 				case CMD_LIST:
@@ -2276,7 +2388,7 @@ files_out:
 	idevice_free(device);
 	device = NULL;
 
-	if (backup_password) {
+	if (backup_password && password_allocated) {
 		free(backup_password);
 	}
 
@@ -2287,6 +2399,11 @@ files_out:
 		source_udid = NULL;
 	}
 
+	// Cleanup the last processed file tracking
+	if (last_processed_file) {
+		free(last_processed_file);
+		last_processed_file = NULL;
+	}
+
 	return result_code;
 }
-

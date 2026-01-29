@@ -61,6 +61,8 @@ The following libraries must be installed:
 | **OpenSSL** | 1.1.0+ or 3.0+ | Cryptographic operations (AES, HMAC) |
 | **libzip** | 1.7.0+ | ZIP archive handling |
 | **readline** | 8.0+ | Command-line input (optional) |
+| **libirecovery** | 1.0.0+ | Recovery mode device communication |
+| **SQLite3** | 3.0+ | Manifest.db database handling |
 
 ---
 
@@ -136,6 +138,7 @@ sudo ldconfig
 # Check if libraries are found
 pkg-config --modversion libimobiledevice-1.0
 pkg-config --modversion libplist-2.0
+pkg-config --modversion libirecovery-1.0
 pkg-config --libs openssl libzip
 
 # Test device detection
@@ -169,12 +172,47 @@ gcc -o mdm_patch \
     utils.c \
     -I. \
     -D_GNU_SOURCE \
-    $(pkg-config --cflags --libs libimobiledevice-1.0 libimobiledevice-glue-1.0 libplist-2.0 openssl libzip) \
-    -lreadline -lm
+    $(pkg-config --cflags --libs libimobiledevice-1.0 libimobiledevice-glue-1.0 libplist-2.0 openssl libzip libirecovery-1.0) \
+    -lreadline -lm -lsqlite3
 
 # Make executable
 chmod +x mdm_patch
 ```
+
+---
+
+
+## Decrypting Encrypted Backups
+
+If you have an encrypted iOS backup and want to use it with `--backup-source`, you must first decrypt it using the included Python tool.
+
+### Setup
+
+```bash
+# Navigate to the tools directory
+cd tools
+
+# Option 1: Use the setup script (creates virtual environment)
+./setup_venv.sh
+source .venv/bin/activate
+
+# Option 2: Install dependencies directly
+pip install iphone_backup_decrypt tqdm
+```
+
+### Usage
+
+```bash
+# With password prompt (recommended)
+python3 tools/decrypt_backup.py /path/to/encrypted_backup -o /path/to/decrypted_output
+
+# With inline password
+python3 tools/decrypt_backup.py /path/to/encrypted_backup -o /path/to/decrypted_output -p "your_password"
+```
+
+The decrypted backup will be created at the output path, preserving the iOS backup structure required for restoration.
+
+**Note:** The decryption tool preserves the `BackupKeyBag` in `Manifest.plist`, which is required by iOS 15+ for restore operations.
 
 ---
 
@@ -189,7 +227,9 @@ chmod +x mdm_patch
 4. Connect device via USB
 5. Trust the computer when prompted on device
 
-### Running the Patcher
+### Running the Patcher (Template Mode)
+
+This mode uses the built-in template backup. It's the simplest approach but creates a minimal backup.
 
 ```bash
 # Ensure required files are in the current directory
@@ -199,10 +239,43 @@ ls extension1.pdf extension2.pdf libiMobileeDevice.dylib
 ./mdm_patch
 ```
 
+### Running the Patcher (User Backup Mode)
+
+This mode uses your own decrypted backup, preserving your data while removing MDM profiles. This is useful when you want to keep apps, settings, and data from an existing backup.
+
+```bash
+# Step 1: Decrypt your encrypted backup (if needed)
+python3 tools/decrypt_backup.py ~/Library/Application\ Support/MobileSync/Backup/DEVICE_UDID \
+    -o ~/DecryptedBackup
+
+# Step 2: Run the patcher with your backup
+./mdm_patch --backup-source ~/DecryptedBackup
+
+# Alternative: Modify backup in-place (saves disk space, modifies original)
+./mdm_patch --backup-source ~/DecryptedBackup --in-place
+
+# Alternative: Preview changes without restoring (dry-run)
+./mdm_patch --backup-source ~/DecryptedBackup --dry-run
+
+# Alternative: Specify target device UDID explicitly
+./mdm_patch --backup-source ~/DecryptedBackup --target-udid 00008150-XXXX
+```
+
+**Command-line Options:**
+
+| Option | Description |
+|--------|-------------|
+| `-b, --backup-source PATH` | Use existing decrypted backup instead of built-in template |
+| `-u, --target-udid UDID` | Target device UDID (default: auto-detect connected device) |
+| `-i, --in-place` | Modify backup directly instead of copying (saves disk space) |
+| `-n, --dry-run` | Preview changes without performing restore |
+| `-h, --help` | Show help message |
+| `-V, --version` | Show version information |
+
 ### Expected Output
 
 ```
-MDM Patcher v1.0
+MDM Patcher v1.1
 ================
 
 Waiting for device...
@@ -293,6 +366,22 @@ sudo usermod -aG plugdev $USER
 4. Keep device unlocked during the process
 5. Try rebooting device and starting over
 
+### "Restore Failed (Error Code: -205)" / "No keybag in manifest"
+
+**Causes:**
+- Missing `BackupKeyBag` in `Manifest.plist` (required by iOS 15+)
+- Backup was decrypted with an older version of the decrypt tool that removed the keybag
+
+**Solutions:**
+1. Re-decrypt your backup using the updated `tools/decrypt_backup.py` script
+2. The updated script preserves `BackupKeyBag` which is required for iOS 15+ restore operations
+
+```bash
+# Re-decrypt with updated tool
+python3 tools/decrypt_backup.py /path/to/original_encrypted_backup \
+    -o /path/to/new_decrypted_backup
+```
+
 ### Build Errors
 
 **"Package libimobiledevice-1.0 was not found"**
@@ -338,7 +427,11 @@ mdmpatcher/
 ├── endianness.h                # Endian conversion macros
 ├── extension1.pdf              # Encrypted Info.plist template
 ├── extension2.pdf              # Encrypted Manifest.plist template
-└── libiMobileeDevice.dylib     # Encrypted backup structure
+├── libiMobileeDevice.dylib     # Encrypted backup structure
+└── tools/
+    ├── decrypt_backup.py       # Backup decryption script (Python)
+    ├── requirements.txt        # Python dependencies
+    └── setup_venv.sh           # Virtual environment setup script
 ```
 
 
@@ -348,6 +441,11 @@ mdmpatcher/
 - **libimobiledevice** team for iOS communication libraries
 - **RNCryptor** specification for the encryption format
 - Community contributors for testing and feedback
+
+## TODO
+
+* Remove SetupState key from HomeDomain/Library/Preferences/com.apple.purplebuddy.plist before restoring pre-existing backup
+* Maybe clean HomeDomain/Library/Accounts/Accounts3.sqlite entries? (Not confirmed if necessary)
 
 ---
 
@@ -360,6 +458,17 @@ This project is provided as-is for educational purposes. Users are responsible f
 ---
 
 ## Changelog
+
+### v1.1.0 (User Backup Mode)
+- ✅ User backup mode (`--backup-source`) - restore from your own decrypted backups
+- ✅ In-place modification (`--in-place`) - modify backup directly, saves disk space
+- ✅ Dry-run mode (`--dry-run`) - preview changes without performing restore
+- ✅ Target device UDID (`--target-udid`) - specify device explicitly
+- ✅ Backup decryption tool (`tools/decrypt_backup.py`) - decrypt iOS encrypted backups
+- ✅ ConfigurationProfiles injection - automatically injects clean profiles from template
+- ✅ iOS 15+ BackupKeyBag compatibility - preserves keybag required for restore
+- ✅ SQLite3 Manifest.db support - proper handling of backup database
+- ✅ Improved error messages with specific error codes
 
 ### v1.0.0 (Initial Linux Port)
 - ✅ Ported from Swift/macOS to C/Linux
@@ -393,7 +502,9 @@ A: No. Activation Lock is a separate security feature and cannot be bypassed wit
 
 <div align="center">
 
-**For support and updates, visit the [original repository](https://github.com/fled-dev/MDMPatcher-Enhanced)**
+**For support and updates, visit the [repository](https://github.com/pruiz/MDMPatcher-Linux)**
+
+*Based on [MDMPatcher Enhanced](https://github.com/fled-dev/MDMPatcher-Enhanced) by fled-dev*
 
 *Last Updated: January 2026*
 

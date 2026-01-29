@@ -1,0 +1,2 @@
+iphone_backup_decrypt>=0.9.0
+tqdm>=4.0.0

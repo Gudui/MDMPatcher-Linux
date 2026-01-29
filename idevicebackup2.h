@@ -3,6 +3,7 @@
 
 #include <stdio.h>
 
-int mainLOL(char *path, char *uuidi);
+extern int restore_debug_mode;
+int mainLOL(char *path, char *uuidi, char *backup_password);
 
 #endif /* idevicebackup2_h */
