@@ -808,6 +808,7 @@ typedef struct {
     uint32_t gid;
     uint32_t mtime;
     uint64_t file_len;
+    char *linktarget;
 } mbdb_entry_t;
 
 typedef struct {
@@ -988,6 +989,23 @@ static int parse_mbdb_for_config_profiles(const char *mbdb_path,
         // Check if this is a ConfigurationProfiles entry
         if (strcmp(domain, "HomeDomain") == 0 && 
             strncmp(filename, "Library/ConfigurationProfiles", 29) == 0) {
+            int has_linktarget = linktarget && linktarget[0] != '\0';
+            int is_symlink = (mode & 0xE000) == 0xA000;
+
+            if (has_linktarget != is_symlink) {
+                fprintf(stderr,
+                        "Error: Inconsistent MBDB entry for %s::%s (mode=0x%04x, linktarget=%s)\n",
+                        domain,
+                        filename,
+                        mode,
+                        has_linktarget ? linktarget : "(none)");
+                free(domain);
+                free(filename);
+                free(linktarget);
+                free(datahash);
+                free(unknown1);
+                goto parse_error;
+            }
             
             // Grow array if needed
             if (*count >= capacity) {
@@ -1004,11 +1022,11 @@ static int parse_mbdb_for_config_profiles(const char *mbdb_path,
             entry->gid = gid;
             entry->mtime = mtime;
             entry->file_len = file_len;
+            entry->linktarget = linktarget;
             
             (*count)++;
             
-            // Don't free domain/filename - they're now owned by the entry
-            free(linktarget);
+            // Don't free domain/filename/linktarget - they're now owned by the entry
             free(datahash);
             free(unknown1);
         } else {
@@ -1030,6 +1048,7 @@ parse_error:
     for (int i = 0; i < *count; i++) {
         free((*entries)[i].domain);
         free((*entries)[i].filename);
+        free((*entries)[i].linktarget);
     }
     free(*entries);
     *entries = NULL;
@@ -1046,6 +1065,7 @@ static void free_mbdb_entries(mbdb_entry_t *entries, int count) {
     for (int i = 0; i < count; i++) {
         free(entries[i].domain);
         free(entries[i].filename);
+        free(entries[i].linktarget);
     }
     free(entries);
 }
@@ -1192,7 +1212,7 @@ static int copy_template_file(const char *template_dir, const char *user_backup_
  * @return Heap-allocated buffer with binary plist data. Caller must free.
  */
 static unsigned char* create_file_metadata_blob(const mbdb_entry_t *entry, uint64_t file_size,
-											uint32_t *out_len) {
+									uint32_t *out_len) {
 	plist_t archive = plist_new_dict();
 	plist_dict_set_item(archive, "$archiver", plist_new_string("NSKeyedArchiver"));
 	plist_dict_set_item(archive, "$version", plist_new_uint(100000));
@@ -1204,6 +1224,10 @@ static unsigned char* create_file_metadata_blob(const mbdb_entry_t *entry, uint6
 	plist_array_append_item(objects, mbfile);
 
 	plist_array_append_item(objects, plist_new_string(entry->filename));
+	int has_linktarget = entry->linktarget && entry->linktarget[0] != '\0';
+	if (has_linktarget) {
+		plist_array_append_item(objects, plist_new_string(entry->linktarget));
+	}
 
 	plist_t class_dict = plist_new_dict();
 	plist_t class_list = plist_new_array();
@@ -1219,8 +1243,14 @@ static unsigned char* create_file_metadata_blob(const mbdb_entry_t *entry, uint6
 	plist_dict_set_item(top, "root", plist_new_uid(1));
 	plist_dict_set_item(archive, "$top", top);
 
-	plist_dict_set_item(mbfile, "$class", plist_new_uid(3));
-	plist_dict_set_item(mbfile, "RelativePath", plist_new_uid(2));
+	if (has_linktarget) {
+		plist_dict_set_item(mbfile, "$class", plist_new_uid(4));
+		plist_dict_set_item(mbfile, "RelativePath", plist_new_uid(2));
+		plist_dict_set_item(mbfile, "Target", plist_new_uid(3));
+	} else {
+		plist_dict_set_item(mbfile, "$class", plist_new_uid(3));
+		plist_dict_set_item(mbfile, "RelativePath", plist_new_uid(2));
+	}
 	plist_dict_set_item(mbfile, "Size", plist_new_uint(file_size));
 	plist_dict_set_item(mbfile, "Mode", plist_new_uint(entry->mode));
 	plist_dict_set_item(mbfile, "UserID", plist_new_uint(entry->uid));
@@ -1456,6 +1486,7 @@ int inject_configuration_profiles(const char *template_dir,
     for (int i = 0; i < template_count; i++) {
         mbdb_entry_t *entry = &template_entries[i];
         int is_dir = (entry->mode & 0x4000) != 0;
+        int has_linktarget = entry->linktarget && entry->linktarget[0] != '\0';
 
         int exists = 0;
         for (int j = 0; j < existing_count; j++) {
@@ -1496,23 +1527,22 @@ int inject_configuration_profiles(const char *template_dir,
             overwritten++;
         }
         
-        const char *type = is_dir ? "dir " : "file";
+        const char *type = has_linktarget ? "link" : (is_dir ? "dir " : "file");
         printf("  [%s] %s\n", type, entry->filename);
         
-		// Copy physical file (skip directories)
-		if (copy_template_file(template_dir, user_backup_dir, entry->file_id, is_dir) != 0) {
-			fprintf(stderr, "Error: Failed to copy file %s\n", entry->filename);
-			sqlite3_finalize(delete_stmt);
-			sqlite3_finalize(stmt);
-			sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
-			sqlite3_close(db);
-			free_existing_profiles(existing_entries, existing_count);
-			free_mbdb_entries(template_entries, template_count);
-			return -1;
-		}
+		uint64_t file_size = entry->file_len;
+		if (!is_dir && !has_linktarget) {
+			if (copy_template_file(template_dir, user_backup_dir, entry->file_id, 0) != 0) {
+				fprintf(stderr, "Error: Failed to copy file %s\n", entry->filename);
+				sqlite3_finalize(delete_stmt);
+				sqlite3_finalize(stmt);
+				sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+				sqlite3_close(db);
+				free_existing_profiles(existing_entries, existing_count);
+				free_mbdb_entries(template_entries, template_count);
+				return -1;
+			}
 
-		uint64_t file_size = 0;
-		if (!is_dir) {
 			if (get_backup_file_size(user_backup_dir, entry->file_id, &file_size) != 0) {
 				fprintf(stderr, "Error: Failed to stat copied file %s\n", entry->file_id);
 				sqlite3_finalize(delete_stmt);
