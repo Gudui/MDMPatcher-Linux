@@ -17,6 +17,7 @@
 
 int restore_debug_mode = 0;
 int show_file_digests = 0;
+int abort_on_missing_files = 0;
 
 static struct option long_options[] = {
     {"backup-source", required_argument, 0, 'b'},
@@ -28,6 +29,7 @@ static struct option long_options[] = {
     {"show-size-mismatches", no_argument, 0, 1002},
     {"show-file-digests", no_argument, 0, 1003},
     {"show-digest-mismatches", no_argument, 0, 1004},
+    {"abort-on-missing-files", no_argument, 0, 1005},
     {"dry-run",       no_argument,       0, 'n'},
     {"debug",         no_argument,       0, 'd'},
     {"help",          no_argument,       0, 'h'},
@@ -48,6 +50,7 @@ static void print_usage(const char *progname) {
     printf("      --show-size-mismatches  Log each Manifest.db size mismatch\n");
     printf("      --show-file-digests  Log SHA1 for each sent file\n");
     printf("      --show-digest-mismatches  Log each Manifest.db digest mismatch\n");
+    printf("      --abort-on-missing-files  Abort restore if any backup file is missing\n");
     printf("  -n, --dry-run              Preview changes without restoring\n");
     printf("  -d, --debug                Enable debug output (show each file during restore)\n");
     printf("  -h, --help                 Show this help message\n");
@@ -124,6 +127,7 @@ int main(int argc, char *argv[]) {
     int show_size_mismatches = 0;
     int show_file_digests_flag = 0;
     int show_digest_mismatches = 0;
+    int abort_on_missing_files_flag = 0;
     int dry_run = 0;
     int c;
 
@@ -157,6 +161,9 @@ int main(int argc, char *argv[]) {
             case 1004:
                 show_digest_mismatches = 1;
                 break;
+            case 1005:
+                abort_on_missing_files_flag = 1;
+                break;
             case 'n':
                 dry_run = 1;
                 break;
@@ -180,6 +187,10 @@ int main(int argc, char *argv[]) {
 
     if (show_file_digests_flag) {
         show_file_digests = 1;
+    }
+
+    if (abort_on_missing_files_flag) {
+        abort_on_missing_files = 1;
     }
 
     if (backup_source_path) {

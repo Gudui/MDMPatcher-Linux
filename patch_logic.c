@@ -1625,13 +1625,14 @@ static int copy_template_file(const char *template_dir, const char *user_backup_
  * @return Heap-allocated buffer with binary plist data. Caller must free.
  */
 static unsigned char* create_file_metadata_blob(const mbdb_entry_t *entry, uint64_t file_size,
-									uint32_t *out_len) {
+                                                uint64_t inode_number, const unsigned char *digest,
+                                                uint32_t *out_len) {
 	plist_t archive = plist_new_dict();
 	plist_dict_set_item(archive, "$archiver", plist_new_string("NSKeyedArchiver"));
 	plist_dict_set_item(archive, "$version", plist_new_uint(100000));
 
 	plist_t objects = plist_new_array();
-	plist_array_append_item(objects, plist_new_null());
+	plist_array_append_item(objects, plist_new_string("$null"));
 
 	plist_t mbfile = plist_new_dict();
 	plist_array_append_item(objects, mbfile);
@@ -1672,8 +1673,14 @@ static unsigned char* create_file_metadata_blob(const mbdb_entry_t *entry, uint6
 	plist_dict_set_item(mbfile, "LastStatusChange", plist_new_uint(entry->mtime));
 	plist_dict_set_item(mbfile, "Birth", plist_new_uint(entry->mtime));
 	plist_dict_set_item(mbfile, "Flags", plist_new_uint(0));
-	plist_dict_set_item(mbfile, "InodeNumber", plist_new_uint(0));
+	plist_dict_set_item(mbfile, "InodeNumber", plist_new_uint(inode_number));
 	plist_dict_set_item(mbfile, "ProtectionClass", plist_new_uint(4));
+	if (digest) {
+		plist_array_append_item(objects,
+							  plist_new_data((const char *)digest, SHA_DIGEST_LENGTH));
+		uint32_t digest_index = (uint32_t)plist_array_get_size(objects) - 1;
+		plist_dict_set_item(mbfile, "Digest", plist_new_uid(digest_index));
+	}
 
 	char *plist_bin = NULL;
 	uint32_t plist_len = 0;
@@ -1682,6 +1689,247 @@ static unsigned char* create_file_metadata_blob(const mbdb_entry_t *entry, uint6
 
 	*out_len = plist_len;
 	return (unsigned char *)plist_bin;
+}
+
+static int plist_uid_to_index(plist_t uid_node, uint32_t *index_out) {
+	uint64_t uid = 0;
+
+	if (!uid_node || !index_out) {
+		return -1;
+	}
+
+	if (plist_get_node_type(uid_node) != PLIST_UID) {
+		return -1;
+	}
+
+	plist_get_uid_val(uid_node, &uid);
+	*index_out = (uint32_t)uid;
+	return 0;
+}
+
+static int replace_uid_object(plist_t objects, plist_t uid_node, plist_t new_obj) {
+	uint32_t index = 0;
+
+	if (!objects || !uid_node || !new_obj) {
+		return -1;
+	}
+
+	if (plist_uid_to_index(uid_node, &index) != 0) {
+		return -1;
+	}
+	if (plist_get_node_type(objects) != PLIST_ARRAY || index >= plist_array_get_size(objects)) {
+		return -1;
+	}
+
+	plist_array_set_item(objects, new_obj, index);
+	return 0;
+}
+
+static void update_mbfile_uid_string(plist_t objects, plist_t mbfile, const char *key,
+							   const char *value) {
+	plist_t node = NULL;
+
+	if (!objects || !mbfile || !key || !value) {
+		return;
+	}
+
+	node = plist_dict_get_item(mbfile, key);
+	if (!node) {
+		plist_dict_set_item(mbfile, key, plist_new_string(value));
+		return;
+	}
+
+	if (plist_get_node_type(node) == PLIST_UID) {
+		replace_uid_object(objects, node, plist_new_string(value));
+	} else if (plist_get_node_type(node) == PLIST_STRING) {
+		plist_set_string_val(node, value);
+	} else {
+		plist_dict_set_item(mbfile, key, plist_new_string(value));
+	}
+}
+
+static void update_mbfile_digest(plist_t objects, plist_t mbfile, const unsigned char *digest) {
+	plist_t digest_node = NULL;
+
+	if (!objects || !mbfile || !digest) {
+		return;
+	}
+
+	digest_node = plist_dict_get_item(mbfile, "Digest");
+	if (!digest_node) {
+		plist_array_append_item(objects,
+							  plist_new_data((const char *)digest, SHA_DIGEST_LENGTH));
+		uint32_t digest_index = (uint32_t)plist_array_get_size(objects) - 1;
+		plist_dict_set_item(mbfile, "Digest", plist_new_uid(digest_index));
+		return;
+	}
+
+	plist_type dtype = plist_get_node_type(digest_node);
+	if (dtype == PLIST_UID) {
+		uint32_t index = 0;
+		if (plist_uid_to_index(digest_node, &index) == 0
+				&& plist_get_node_type(objects) == PLIST_ARRAY
+				&& index < plist_array_get_size(objects)) {
+			plist_t obj = plist_array_get_item(objects, index);
+			if (obj && plist_get_node_type(obj) == PLIST_DICT) {
+				plist_t ns_data = plist_dict_get_item(obj, "NS.data");
+				if (ns_data && plist_get_node_type(ns_data) == PLIST_DATA) {
+					plist_dict_set_item(obj, "NS.data",
+											plist_new_data((const char *)digest, SHA_DIGEST_LENGTH));
+					return;
+				}
+			}
+			replace_uid_object(objects, digest_node,
+							   plist_new_data((const char *)digest, SHA_DIGEST_LENGTH));
+		}
+	} else if (dtype == PLIST_DATA) {
+		plist_dict_set_item(mbfile, "Digest",
+							plist_new_data((const char *)digest, SHA_DIGEST_LENGTH));
+	} else if (dtype == PLIST_DICT) {
+		plist_t ns_data = plist_dict_get_item(digest_node, "NS.data");
+		if (ns_data && plist_get_node_type(ns_data) == PLIST_DATA) {
+			plist_dict_set_item(digest_node, "NS.data",
+										plist_new_data((const char *)digest, SHA_DIGEST_LENGTH));
+		}
+	}
+}
+
+static unsigned char* clone_metadata_blob_from_reference(const unsigned char *ref_blob,
+											int ref_blob_len,
+											const mbdb_entry_t *entry,
+											uint64_t file_size,
+											uint64_t inode_number,
+											const unsigned char *digest,
+											uint32_t *out_len) {
+	plist_t archive = NULL;
+	plist_t objects = NULL;
+	plist_t mbfile = NULL;
+	char *plist_bin = NULL;
+	uint32_t plist_len = 0;
+
+	if (!ref_blob || ref_blob_len <= 0 || !entry || !out_len) {
+		return NULL;
+	}
+
+	plist_from_bin((const char *)ref_blob, (uint32_t)ref_blob_len, &archive);
+	if (!archive) {
+		return NULL;
+	}
+
+	objects = plist_dict_get_item(archive, "$objects");
+	if (!objects || plist_get_node_type(objects) != PLIST_ARRAY
+			|| plist_array_get_size(objects) < 2) {
+		plist_free(archive);
+		return NULL;
+	}
+
+	mbfile = plist_array_get_item(objects, 1);
+	if (!mbfile || plist_get_node_type(mbfile) != PLIST_DICT) {
+		plist_free(archive);
+		return NULL;
+	}
+
+	update_mbfile_uid_string(objects, mbfile, "RelativePath", entry->filename);
+	if (entry->linktarget && entry->linktarget[0] != '\0') {
+		update_mbfile_uid_string(objects, mbfile, "Target", entry->linktarget);
+	}
+
+	plist_dict_set_item(mbfile, "Size", plist_new_uint(file_size));
+	plist_dict_set_item(mbfile, "Mode", plist_new_uint(entry->mode));
+	plist_dict_set_item(mbfile, "UserID", plist_new_uint(entry->uid));
+	plist_dict_set_item(mbfile, "GroupID", plist_new_uint(entry->gid));
+	plist_dict_set_item(mbfile, "LastModified", plist_new_uint(entry->mtime));
+	plist_dict_set_item(mbfile, "LastStatusChange", plist_new_uint(entry->mtime));
+	plist_dict_set_item(mbfile, "Birth", plist_new_uint(entry->mtime));
+	plist_dict_set_item(mbfile, "InodeNumber", plist_new_uint(inode_number));
+
+	update_mbfile_digest(objects, mbfile, digest);
+
+	plist_to_bin(archive, &plist_bin, &plist_len);
+	plist_free(archive);
+
+	if (!plist_bin || plist_len == 0) {
+		return NULL;
+	}
+
+	*out_len = plist_len;
+	return (unsigned char *)plist_bin;
+}
+
+static int extract_inode_from_blob(const unsigned char *file_blob, int file_blob_len,
+                                   uint64_t *inode_out) {
+    plist_t file_plist = NULL;
+    plist_from_bin((const char *)file_blob, (uint32_t)file_blob_len, &file_plist);
+    if (!file_plist) {
+        return -1;
+    }
+
+    plist_t objects = plist_dict_get_item(file_plist, "$objects");
+    plist_t mbfile = NULL;
+    if (objects && plist_get_node_type(objects) == PLIST_ARRAY && plist_array_get_size(objects) > 1) {
+        mbfile = plist_array_get_item(objects, 1);
+    }
+
+    if (!mbfile || plist_get_node_type(mbfile) != PLIST_DICT) {
+        plist_free(file_plist);
+        return -1;
+    }
+
+    plist_t inode_node = plist_dict_get_item(mbfile, "InodeNumber");
+    if (!inode_node) {
+        plist_free(file_plist);
+        return -1;
+    }
+
+    uint64_t inode_value = 0;
+    plist_type inode_type = plist_get_node_type(inode_node);
+    if (inode_type == PLIST_UINT) {
+        plist_get_uint_val(inode_node, &inode_value);
+    } else if (inode_type == PLIST_UID && objects && plist_get_node_type(objects) == PLIST_ARRAY) {
+        uint64_t inode_uid = 0;
+        plist_get_uid_val(inode_node, &inode_uid);
+        if (inode_uid < plist_array_get_size(objects)) {
+            plist_t inode_obj = plist_array_get_item(objects, (uint32_t)inode_uid);
+            if (inode_obj && plist_get_node_type(inode_obj) == PLIST_UINT) {
+                plist_get_uint_val(inode_obj, &inode_value);
+            }
+        }
+    }
+
+    plist_free(file_plist);
+    if (inode_value == 0) {
+        return -1;
+    }
+
+    *inode_out = inode_value;
+    return 0;
+}
+
+static uint64_t find_max_manifest_inode(sqlite3 *db) {
+    sqlite3_stmt *stmt = NULL;
+    uint64_t max_inode = 0;
+
+    if (sqlite3_prepare_v2(db, "SELECT file FROM Files", -1, &stmt, NULL) != SQLITE_OK) {
+        return 0;
+    }
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const unsigned char *file_blob = (const unsigned char *)sqlite3_column_blob(stmt, 0);
+        int file_blob_len = sqlite3_column_bytes(stmt, 0);
+        if (!file_blob || file_blob_len <= 0) {
+            continue;
+        }
+
+        uint64_t inode_value = 0;
+        if (extract_inode_from_blob(file_blob, file_blob_len, &inode_value) == 0) {
+            if (inode_value > max_inode) {
+                max_inode = inode_value;
+            }
+        }
+    }
+
+    sqlite3_finalize(stmt);
+    return max_inode;
 }
 
 static int get_backup_file_size(const char *backup_dir, const char *file_id, uint64_t *file_size) {
@@ -1698,6 +1946,70 @@ static int get_backup_file_size(const char *backup_dir, const char *file_id, uin
 	}
 
 	*file_size = (uint64_t)st.st_size;
+	return 0;
+}
+
+static int get_backup_file_digest(const char *backup_dir, const char *file_id,
+                                  unsigned char *digest_out) {
+    char file_path[1024];
+
+    if (!backup_dir || !file_id || !digest_out) {
+        return -1;
+    }
+
+    snprintf(file_path, sizeof(file_path), "%s/%c%c/%s",
+             backup_dir, file_id[0], file_id[1], file_id);
+    if (compute_file_sha1(file_path, digest_out) != 0) {
+        return -1;
+    }
+
+	return 0;
+}
+
+static int load_reference_metadata_blob(sqlite3 *db, const char *relative_path,
+									unsigned char **out_blob,
+									int *out_len) {
+	sqlite3_stmt *stmt = NULL;
+	int rc = 0;
+	const void *blob = NULL;
+	int blob_len = 0;
+
+	if (!db || !relative_path || !out_blob || !out_len) {
+		return -1;
+	}
+
+	*out_blob = NULL;
+	*out_len = 0;
+
+	rc = sqlite3_prepare_v2(db,
+		"SELECT file FROM Files WHERE domain = 'HomeDomain' AND relativePath = ? LIMIT 1",
+		-1, &stmt, NULL);
+	if (rc != SQLITE_OK) {
+		return -1;
+	}
+
+	sqlite3_bind_text(stmt, 1, relative_path, -1, SQLITE_STATIC);
+	if (sqlite3_step(stmt) != SQLITE_ROW) {
+		sqlite3_finalize(stmt);
+		return -1;
+	}
+
+	blob = sqlite3_column_blob(stmt, 0);
+	blob_len = sqlite3_column_bytes(stmt, 0);
+	if (!blob || blob_len <= 0) {
+		sqlite3_finalize(stmt);
+		return -1;
+	}
+
+	*out_blob = malloc((size_t)blob_len);
+	if (!*out_blob) {
+		sqlite3_finalize(stmt);
+		return -1;
+	}
+	memcpy(*out_blob, blob, (size_t)blob_len);
+	*out_len = blob_len;
+
+	sqlite3_finalize(stmt);
 	return 0;
 }
 
@@ -1795,20 +2107,40 @@ int inject_configuration_profiles(const char *template_dir,
         return -1;
     }
 
-    if (existing_count > 0) {
-        if (overwrite_existing) {
-            printf("[ConfigProfiles] Found %d existing entries in user backup - will be overwritten\n",
-                   existing_count);
-        } else {
-            printf("[ConfigProfiles] Found %d existing entries in user backup - will be preserved\n",
-                   existing_count);
-        }
-    }
-    
-    if (dry_run) {
-        int skipped = 0;
-        int overwritten = 0;
-        int injected = 0;
+	if (existing_count > 0) {
+		if (overwrite_existing) {
+			printf("[ConfigProfiles] Found %d existing entries in user backup - will be overwritten\n",
+			       existing_count);
+		} else {
+			printf("[ConfigProfiles] Found %d existing entries in user backup - will be preserved\n",
+			       existing_count);
+		}
+	}
+
+	unsigned char *reference_blob = NULL;
+	int reference_blob_len = 0;
+	const char *reference_paths[] = {
+		"Library/UserConfigurationProfiles/PublicInfo/MCMeta.plist",
+		"Library/UserConfigurationProfiles/PublicInfo/NamespacedUserSettings.plist",
+		"Library/UserConfigurationProfiles/PublicInfo/EffectiveUserSettings.plist",
+		"Library/UserConfigurationProfiles/PayloadDependency.plist",
+		NULL
+	};
+	for (int i = 0; reference_paths[i]; i++) {
+		if (load_reference_metadata_blob(db, reference_paths[i],
+								&reference_blob, &reference_blob_len) == 0) {
+			printf("[ConfigProfiles] Using metadata template: %s\n", reference_paths[i]);
+			break;
+		}
+	}
+	if (!reference_blob) {
+		printf("[ConfigProfiles] Warning: no metadata template found; using fallback blobs\n");
+	}
+	
+	if (dry_run) {
+		int skipped = 0;
+		int overwritten = 0;
+		int injected = 0;
 
         printf("\n[ConfigProfiles] DRY RUN - would perform the following:\n");
         printf("  - Inject %d entries from template:\n", template_count);
@@ -1845,34 +2177,37 @@ int inject_configuration_profiles(const char *template_dir,
             printf("  - Overwrote %d existing entries\n", overwritten);
         }
 
-        sqlite3_close(db);
-        free_existing_profiles(existing_entries, existing_count);
-        free_mbdb_entries(template_entries, template_count);
-        return injected;
-    }
+		sqlite3_close(db);
+		free_existing_profiles(existing_entries, existing_count);
+		free_mbdb_entries(template_entries, template_count);
+		free(reference_blob);
+		return injected;
+	}
     
     // Begin transaction
     rc = sqlite3_exec(db, "BEGIN TRANSACTION", NULL, NULL, NULL);
-    if (rc != SQLITE_OK) {
-        fprintf(stderr, "Error: Cannot begin transaction: %s\n", sqlite3_errmsg(db));
-        sqlite3_close(db);
-        free_existing_profiles(existing_entries, existing_count);
-        free_mbdb_entries(template_entries, template_count);
-        return -1;
-    }
+	if (rc != SQLITE_OK) {
+		fprintf(stderr, "Error: Cannot begin transaction: %s\n", sqlite3_errmsg(db));
+		sqlite3_close(db);
+		free_existing_profiles(existing_entries, existing_count);
+		free_mbdb_entries(template_entries, template_count);
+		free(reference_blob);
+		return -1;
+	}
 
     sqlite3_stmt *delete_stmt = NULL;
     rc = sqlite3_prepare_v2(db,
         "DELETE FROM Files WHERE domain = 'HomeDomain' AND relativePath = ?",
         -1, &delete_stmt, NULL);
-    if (rc != SQLITE_OK) {
-        fprintf(stderr, "Error: Failed to prepare delete statement: %s\n", sqlite3_errmsg(db));
-        sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
-        sqlite3_close(db);
-        free_existing_profiles(existing_entries, existing_count);
-        free_mbdb_entries(template_entries, template_count);
-        return -1;
-    }
+	if (rc != SQLITE_OK) {
+		fprintf(stderr, "Error: Failed to prepare delete statement: %s\n", sqlite3_errmsg(db));
+		sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+		sqlite3_close(db);
+		free_existing_profiles(existing_entries, existing_count);
+		free_mbdb_entries(template_entries, template_count);
+		free(reference_blob);
+		return -1;
+	}
     
     // Inject files from template
     printf("[ConfigProfiles] Copying from template:\n");
@@ -1883,16 +2218,24 @@ int inject_configuration_profiles(const char *template_dir,
         "VALUES (?, ?, ?, ?, ?)",
         -1, &stmt, NULL);
     
-    if (rc != SQLITE_OK) {
-        fprintf(stderr, "Error: Failed to prepare insert statement: %s\n", sqlite3_errmsg(db));
-        sqlite3_finalize(delete_stmt);
-        sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
-        sqlite3_close(db);
-        free_existing_profiles(existing_entries, existing_count);
-        free_mbdb_entries(template_entries, template_count);
-        return -1;
-    }
+	if (rc != SQLITE_OK) {
+		fprintf(stderr, "Error: Failed to prepare insert statement: %s\n", sqlite3_errmsg(db));
+		sqlite3_finalize(delete_stmt);
+		sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+		sqlite3_close(db);
+		free_existing_profiles(existing_entries, existing_count);
+		free_mbdb_entries(template_entries, template_count);
+		free(reference_blob);
+		return -1;
+	}
     
+    uint64_t max_inode = find_max_manifest_inode(db);
+    uint64_t next_inode = (max_inode > 0) ? (max_inode + 1) : 1;
+    if (max_inode == 0) {
+        printf("[ConfigProfiles] Warning: No inode metadata found; starting from 1\n");
+    }
+    printf("[ConfigProfiles] Max inode in backup: %llu\n", (unsigned long long)max_inode);
+
     int injected = 0;
     int skipped = 0;
     int overwritten = 0;
@@ -1926,17 +2269,18 @@ int inject_configuration_profiles(const char *template_dir,
             sqlite3_reset(delete_stmt);
             sqlite3_bind_text(delete_stmt, 1, entry->filename, -1, SQLITE_STATIC);
             rc = sqlite3_step(delete_stmt);
-            if (rc != SQLITE_DONE) {
-                fprintf(stderr, "Error: Failed to delete existing entry for %s: %s\n",
-                        entry->filename, sqlite3_errmsg(db));
-                sqlite3_finalize(delete_stmt);
-                sqlite3_finalize(stmt);
-                sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
-                sqlite3_close(db);
-                free_existing_profiles(existing_entries, existing_count);
-                free_mbdb_entries(template_entries, template_count);
-                return -1;
-            }
+		if (rc != SQLITE_DONE) {
+			fprintf(stderr, "Error: Failed to delete existing entry for %s: %s\n",
+					entry->filename, sqlite3_errmsg(db));
+			sqlite3_finalize(delete_stmt);
+			sqlite3_finalize(stmt);
+			sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+			sqlite3_close(db);
+			free_existing_profiles(existing_entries, existing_count);
+			free_mbdb_entries(template_entries, template_count);
+			free(reference_blob);
+			return -1;
+		}
             overwritten++;
         }
         
@@ -1944,6 +2288,8 @@ int inject_configuration_profiles(const char *template_dir,
         printf("  [%s] %s\n", type, entry->filename);
         
 		uint64_t file_size = entry->file_len;
+		unsigned char digest[SHA_DIGEST_LENGTH];
+		unsigned char *digest_ptr = NULL;
 		if (!is_dir && !has_linktarget) {
 			if (copy_template_file(template_dir, user_backup_dir, entry->file_id, 0) != 0) {
 				fprintf(stderr, "Error: Failed to copy file %s\n", entry->filename);
@@ -1953,6 +2299,7 @@ int inject_configuration_profiles(const char *template_dir,
 				sqlite3_close(db);
 				free_existing_profiles(existing_entries, existing_count);
 				free_mbdb_entries(template_entries, template_count);
+				free(reference_blob);
 				return -1;
 			}
 
@@ -1964,46 +2311,71 @@ int inject_configuration_profiles(const char *template_dir,
 				sqlite3_close(db);
 				free_existing_profiles(existing_entries, existing_count);
 				free_mbdb_entries(template_entries, template_count);
+				free(reference_blob);
 				return -1;
 			}
+
+			if (get_backup_file_digest(user_backup_dir, entry->file_id, digest) != 0) {
+				fprintf(stderr, "Error: Failed to compute digest for %s\n", entry->file_id);
+				sqlite3_finalize(delete_stmt);
+				sqlite3_finalize(stmt);
+				sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+				sqlite3_close(db);
+				free_existing_profiles(existing_entries, existing_count);
+				free_mbdb_entries(template_entries, template_count);
+				free(reference_blob);
+				return -1;
+			}
+			digest_ptr = digest;
 		}
         
         // Create metadata blob
-		uint32_t blob_len = 0;
-		unsigned char *blob = create_file_metadata_blob(entry, file_size, &blob_len);
-        if (!blob) {
-            fprintf(stderr, "Error: Failed to create metadata for %s\n", entry->filename);
+        uint64_t inode_number = next_inode++;
+        uint32_t blob_len = 0;
+		unsigned char *blob = NULL;
+		if (!is_dir && !has_linktarget && reference_blob) {
+			blob = clone_metadata_blob_from_reference(reference_blob, reference_blob_len, entry,
+												 file_size, inode_number, digest_ptr, &blob_len);
+		}
+		if (!blob) {
+			blob = create_file_metadata_blob(entry, file_size, inode_number,
+										 digest_ptr, &blob_len);
+		}
+		if (!blob) {
+			fprintf(stderr, "Error: Failed to create metadata for %s\n", entry->filename);
 			sqlite3_finalize(delete_stmt);
-            sqlite3_finalize(stmt);
-            sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
-            sqlite3_close(db);
-            free_existing_profiles(existing_entries, existing_count);
-            free_mbdb_entries(template_entries, template_count);
-            return -1;
-        }
+			sqlite3_finalize(stmt);
+			sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+			sqlite3_close(db);
+			free_existing_profiles(existing_entries, existing_count);
+			free_mbdb_entries(template_entries, template_count);
+			free(reference_blob);
+			return -1;
+		}
         
         // Insert into database
         sqlite3_reset(stmt);
         sqlite3_bind_text(stmt, 1, entry->file_id, -1, SQLITE_STATIC);
         sqlite3_bind_text(stmt, 2, entry->domain, -1, SQLITE_STATIC);
         sqlite3_bind_text(stmt, 3, entry->filename, -1, SQLITE_STATIC);
-        sqlite3_bind_int(stmt, 4, is_dir ? 2 : 1);  // flags: 1=file, 2=directory
+        sqlite3_bind_int(stmt, 4, has_linktarget ? 4 : (is_dir ? 2 : 1));
         sqlite3_bind_blob(stmt, 5, blob, blob_len, SQLITE_TRANSIENT);
         
         rc = sqlite3_step(stmt);
         free(blob);
         
-        if (rc != SQLITE_DONE) {
-            fprintf(stderr, "Error: Failed to insert entry for %s: %s\n", 
-                    entry->filename, sqlite3_errmsg(db));
+		if (rc != SQLITE_DONE) {
+			fprintf(stderr, "Error: Failed to insert entry for %s: %s\n", 
+					entry->filename, sqlite3_errmsg(db));
 			sqlite3_finalize(delete_stmt);
-            sqlite3_finalize(stmt);
-            sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
-            sqlite3_close(db);
-            free_existing_profiles(existing_entries, existing_count);
-            free_mbdb_entries(template_entries, template_count);
-            return -1;
-        }
+			sqlite3_finalize(stmt);
+			sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+			sqlite3_close(db);
+			free_existing_profiles(existing_entries, existing_count);
+			free_mbdb_entries(template_entries, template_count);
+			free(reference_blob);
+			return -1;
+		}
         
         injected++;
     }
@@ -2013,18 +2385,20 @@ int inject_configuration_profiles(const char *template_dir,
     
     // Commit transaction
     rc = sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
-    if (rc != SQLITE_OK) {
-        fprintf(stderr, "Error: Failed to commit transaction: %s\n", sqlite3_errmsg(db));
-        sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
-        sqlite3_close(db);
-        free_existing_profiles(existing_entries, existing_count);
-        free_mbdb_entries(template_entries, template_count);
-        return -1;
-    }
+	if (rc != SQLITE_OK) {
+		fprintf(stderr, "Error: Failed to commit transaction: %s\n", sqlite3_errmsg(db));
+		sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+		sqlite3_close(db);
+		free_existing_profiles(existing_entries, existing_count);
+		free_mbdb_entries(template_entries, template_count);
+		free(reference_blob);
+		return -1;
+	}
     
-    sqlite3_close(db);
-    free_existing_profiles(existing_entries, existing_count);
-    free_mbdb_entries(template_entries, template_count);
+	sqlite3_close(db);
+	free_existing_profiles(existing_entries, existing_count);
+	free_mbdb_entries(template_entries, template_count);
+	free(reference_blob);
 
     if (!overwrite_existing && skipped > 0) {
         printf("[ConfigProfiles] Skipped %d existing entries\n", skipped);

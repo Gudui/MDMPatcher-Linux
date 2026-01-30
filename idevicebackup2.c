@@ -86,8 +86,217 @@ typedef struct {
 
 static batch_file_t *last_batch_files = NULL;
 static uint32_t last_batch_count = 0;
+static sqlite3 *missing_manifest_db = NULL;
+static sqlite3_stmt *missing_manifest_stmt = NULL;
+static char *missing_manifest_root = NULL;
+static int missing_total = 0;
+static int missing_skipped = 0;
+static int missing_failed = 0;
 
 #define PRINT_VERBOSE(min_level, ...) if (verbose >= min_level) { printf(__VA_ARGS__); };
+
+static void mb2_missing_manifest_close(void)
+{
+	if (missing_manifest_stmt) {
+		sqlite3_finalize(missing_manifest_stmt);
+		missing_manifest_stmt = NULL;
+	}
+	if (missing_manifest_db) {
+		sqlite3_close(missing_manifest_db);
+		missing_manifest_db = NULL;
+	}
+	if (missing_manifest_root) {
+		free(missing_manifest_root);
+		missing_manifest_root = NULL;
+	}
+}
+
+static void mb2_missing_reset(void)
+{
+	missing_total = 0;
+	missing_skipped = 0;
+	missing_failed = 0;
+	mb2_missing_manifest_close();
+}
+
+static void mb2_print_missing_summary(void)
+{
+	if (missing_total == 0) {
+		return;
+	}
+	PRINT_VERBOSE(1, "[Restore] Missing files: total %d, skipped %d (zero-size placeholders), failed %d\n",
+		missing_total, missing_skipped, missing_failed);
+}
+
+static int mb2_missing_manifest_open(const char *backup_dir)
+{
+	if (!backup_dir) {
+		return -1;
+	}
+	if (missing_manifest_db && missing_manifest_root && strcmp(missing_manifest_root, backup_dir) == 0) {
+		return 0;
+	}
+
+	mb2_missing_manifest_close();
+
+	char *db_path = string_build_path(backup_dir, "MDMB", "Manifest.db", NULL);
+	if (!db_path) {
+		return -1;
+	}
+
+	struct stat st;
+	if (stat(db_path, &st) != 0) {
+		free(db_path);
+		return -1;
+	}
+
+	if (sqlite3_open(db_path, &missing_manifest_db) != SQLITE_OK) {
+		sqlite3_close(missing_manifest_db);
+		missing_manifest_db = NULL;
+		free(db_path);
+		return -1;
+	}
+	free(db_path);
+
+	if (sqlite3_prepare_v2(missing_manifest_db, "SELECT file FROM Files WHERE fileID = ?", -1, &missing_manifest_stmt, NULL) != SQLITE_OK) {
+		sqlite3_finalize(missing_manifest_stmt);
+		missing_manifest_stmt = NULL;
+		sqlite3_close(missing_manifest_db);
+		missing_manifest_db = NULL;
+		return -1;
+	}
+
+	missing_manifest_root = strdup(backup_dir);
+	if (!missing_manifest_root) {
+		mb2_missing_manifest_close();
+		return -1;
+	}
+
+	return 0;
+}
+
+static int mb2_manifest_blob_is_empty_placeholder(const unsigned char *file_blob, int file_blob_len)
+{
+	static const unsigned char empty_digest[SHA_DIGEST_LENGTH] = {
+		0xda, 0x39, 0xa3, 0xee, 0x5e, 0x6b, 0x4b, 0x0d, 0x32, 0x55,
+		0xbf, 0xef, 0x95, 0x60, 0x18, 0x90, 0xaf, 0xd8, 0x07, 0x09
+	};
+	plist_t file_plist = NULL;
+	plist_t objects = NULL;
+	plist_t mbfile = NULL;
+	plist_t size_node = NULL;
+	plist_t digest_node = NULL;
+	plist_t digest_data_node = NULL;
+	uint64_t manifest_size = 0;
+	uint64_t digest_uid = 0;
+
+	if (!file_blob || file_blob_len <= 0) {
+		return 0;
+	}
+
+	plist_from_bin((const char *)file_blob, (uint32_t)file_blob_len, &file_plist);
+	if (!file_plist) {
+		return 0;
+	}
+
+	objects = plist_dict_get_item(file_plist, "$objects");
+	if (objects && plist_get_node_type(objects) == PLIST_ARRAY && plist_array_get_size(objects) > 1) {
+		mbfile = plist_array_get_item(objects, 1);
+	}
+	if (!mbfile || plist_get_node_type(mbfile) != PLIST_DICT) {
+		plist_free(file_plist);
+		return 0;
+	}
+
+	size_node = plist_dict_get_item(mbfile, "Size");
+	if (size_node && plist_get_node_type(size_node) == PLIST_UINT) {
+		plist_get_uint_val(size_node, &manifest_size);
+	}
+	if (manifest_size != 0) {
+		plist_free(file_plist);
+		return 0;
+	}
+
+	digest_node = plist_dict_get_item(mbfile, "Digest");
+	if (!digest_node) {
+		plist_free(file_plist);
+		return 0;
+	}
+
+	plist_type digest_type = plist_get_node_type(digest_node);
+	if (digest_type == PLIST_UID) {
+		if (!objects || plist_get_node_type(objects) != PLIST_ARRAY) {
+			plist_free(file_plist);
+			return 0;
+		}
+		plist_get_uid_val(digest_node, &digest_uid);
+		if (digest_uid >= plist_array_get_size(objects)) {
+			plist_free(file_plist);
+			return 0;
+		}
+		digest_data_node = plist_array_get_item(objects, (uint32_t)digest_uid);
+	} else if (digest_type == PLIST_DATA) {
+		digest_data_node = digest_node;
+	}
+
+	if (!digest_data_node) {
+		plist_free(file_plist);
+		return 0;
+	}
+
+	if (plist_get_node_type(digest_data_node) == PLIST_DICT) {
+		plist_t nested = plist_dict_get_item(digest_data_node, "NS.data");
+		if (nested && plist_get_node_type(nested) == PLIST_DATA) {
+			digest_data_node = nested;
+		} else {
+			plist_free(file_plist);
+			return 0;
+		}
+	} else if (plist_get_node_type(digest_data_node) != PLIST_DATA) {
+		plist_free(file_plist);
+		return 0;
+	}
+
+	char *stored_data = NULL;
+	uint64_t stored_len = 0;
+	plist_get_data_val(digest_data_node, &stored_data, &stored_len);
+
+	int is_empty = 0;
+	if (stored_data && stored_len == SHA_DIGEST_LENGTH) {
+		if (memcmp(stored_data, empty_digest, SHA_DIGEST_LENGTH) == 0) {
+			is_empty = 1;
+		}
+	}
+
+	free(stored_data);
+	plist_free(file_plist);
+	return is_empty;
+}
+
+static int mb2_manifest_is_empty_placeholder(const char *backup_dir, const char *file_id)
+{
+	if (!backup_dir || !file_id) {
+		return 0;
+	}
+	if (mb2_missing_manifest_open(backup_dir) != 0 || !missing_manifest_stmt) {
+		return 0;
+	}
+
+	int is_empty = 0;
+	sqlite3_bind_text(missing_manifest_stmt, 1, file_id, -1, SQLITE_TRANSIENT);
+	int rc = sqlite3_step(missing_manifest_stmt);
+	if (rc == SQLITE_ROW) {
+		const unsigned char *file_blob = sqlite3_column_blob(missing_manifest_stmt, 0);
+		int file_blob_len = sqlite3_column_bytes(missing_manifest_stmt, 0);
+		if (file_blob && file_blob_len > 0) {
+			is_empty = mb2_manifest_blob_is_empty_placeholder(file_blob, file_blob_len);
+		}
+	}
+	sqlite3_reset(missing_manifest_stmt);
+	sqlite3_clear_bindings(missing_manifest_stmt);
+
+	return is_empty;
+}
 
 enum cmd_mode {
 	CMD_BACKUP,
@@ -1177,7 +1386,22 @@ static int mb2_handle_send_file(mobilebackup2_client_t mobilebackup2, const char
 	if (stat(localfile, &fst) < 0)
 #endif
 	{
-		if (errno != ENOENT)
+		if (errno == ENOENT) {
+			missing_total++;
+			if (!abort_on_missing_files) {
+				const char *file_id = strrchr(path, '/');
+				file_id = file_id ? file_id + 1 : path;
+				if (mb2_manifest_is_empty_placeholder(backup_dir, file_id)) {
+					missing_skipped++;
+					if (restore_debug_mode) {
+						PRINT_VERBOSE(1, "  [Missing] Skipping placeholder file: %s\n", path);
+					}
+					errcode = 0;
+					goto leave;
+				}
+			}
+			missing_failed++;
+		}
 		errcode = errno;
 		goto leave;
 	}
@@ -2122,6 +2346,8 @@ checkpoint:
 				break;
 			}
 
+			mb2_missing_reset();
+
 			PRINT_VERBOSE(1, "Starting Restore...\n");
 
 			opts = plist_new_dict();
@@ -2652,16 +2878,18 @@ files_out:
 } else {
 						afc_remove_path(afc, "/iTunesRestore/RestoreApplications.plist");
 						afc_remove_path(afc, "/iTunesRestore");
-						if (quit_flag) {
-							PRINT_VERBOSE(1, "Restore Aborted.\n");
-						} else {
-							PRINT_VERBOSE(1, "Restore Failed (Error Code %d).\n", -result_code);
-							if (last_processed_file) {
-								PRINT_VERBOSE(1, "Last file processed: %s\n", last_processed_file);
-							}
+					if (quit_flag) {
+						PRINT_VERBOSE(1, "Restore Aborted.\n");
+					} else {
+						PRINT_VERBOSE(1, "Restore Failed (Error Code %d).\n", -result_code);
+						if (last_processed_file) {
+							PRINT_VERBOSE(1, "Last file processed: %s\n", last_processed_file);
 						}
 					}
-				break;
+				}
+				mb2_print_missing_summary();
+				mb2_missing_manifest_close();
+			break;
 				case CMD_INFO:
 				case CMD_LIST:
 				case CMD_LEAVE:

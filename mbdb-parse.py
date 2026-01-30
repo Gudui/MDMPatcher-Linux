@@ -98,8 +98,8 @@ def process_mbdb_file(filename):
         fileinfo['datahash'], offset = getstring(data, offset)
         fileinfo['unknown1'], offset = getstring(data, offset)
         fileinfo['mode'], offset = getint(data, offset, 2)
-        fileinfo['unknown2'], offset = getint(data, offset, 4)
-        fileinfo['unknown3'], offset = getint(data, offset, 4)
+        fileinfo['inodeno'], offset = getint(data, offset, 8)
+        #fileinfo['unknown3'], offset = getint(data, offset, 4)
         fileinfo['userid'], offset = getint(data, offset, 4)
         fileinfo['groupid'], offset = getint(data, offset, 4)
         fileinfo['mtime'], offset = getint(data, offset, 4)
@@ -141,10 +141,10 @@ def fileinfo_str(f):
     if not args.l: return ("%s %s" % (f['fileID'], f['fullpath']))
 
     if args.tab: 
-        fmt_str = "%s%s\t%d\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s"
+        fmt_str = "%s%s\t%d\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%lu"
         sep_chr = '\t'
     else:
-        fmt_str = "%s%s %5d %5d %7d %s  %s  %s  %s %s::%s"
+        fmt_str = "%s%s %5d %5d %7d %s  %s  %s  %s %s::%s (%lu)"
         sep_chr = ' '
 
     if (f['mode'] & 0xE000) == 0xA000: type = 'l' # symlink
@@ -157,7 +157,7 @@ def fileinfo_str(f):
     info = (fmt_str %
             (type, modestr(f['mode']&0x0FFF) , f['userid'], f['groupid'], f['filelen'], 
              timestr(f['mtime']), timestr(f['atime']), timestr(f['ctime']), 
-             f['fileID'], f['domain'], f['filename']))
+             f['fileID'], f['domain'], f['filename'], f['inodeno']))
     if type == 'l': info = info + ' -> ' + f['linktarget'] # symlink destination
     for name, value in f['properties'].items(): # extra properties
         info = info + sep_chr + name + '=' + repr(value)
