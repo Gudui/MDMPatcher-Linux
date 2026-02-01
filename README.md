@@ -346,7 +346,12 @@ python3 tools/decrypt_backup.py ~/Library/Application\ Support/MobileSync/Backup
 | `-b, --backup-source PATH` | Use existing decrypted backup instead of built-in template |
 | `-u, --target-udid UDID` | Target device UDID (default: auto-detect connected device) |
 | `-i, --in-place` | Modify backup directly instead of copying (saves disk space) |
+| `--restore-system-files` | Enable restoration of system files (required for ConfigurationProfiles) |
+| `--show-file-digests` | Log SHA1 digest for each file sent during restore |
+| `--show-digest-mismatches` | Log each Manifest.db digest mismatch detected |
+| `--abort-on-missing-files` | Abort restore if any backup file is missing |
 | `-n, --dry-run` | Preview changes without performing restore |
+| `-d, --debug` | Enable debug output (shows each file during restore) |
 | `-h, --help` | Show help message |
 | `-V, --version` | Show version information |
 
